@@ -43,14 +43,11 @@ open class UndergraduateDownloader(context: Context) : CourseDownloader(context)
     }
 
     private val sessionClient by lazy {
-        client.newBuilder()
-            .followRedirects(false)
-            .addInterceptor(TeachingSession(
-                client,
-                loginUrl.toHttpUrl(),
-                "https://jaccount.sjtu.edu.cn/".toHttpUrl(),
-            ))
-            .build()
+        TeachingSession.client(
+            client,
+            loginUrl.toHttpUrl(),
+            "https://jaccount.sjtu.edu.cn/".toHttpUrl(),
+        )
     }
 
     override fun getCourses(year: String, term: String, handler: Handler) {

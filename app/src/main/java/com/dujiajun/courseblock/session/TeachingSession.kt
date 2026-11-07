@@ -11,31 +11,46 @@ import java.io.IOException
  * Restores the teaching site's session through the existing account session.
  * The interactive login screen is needed only when this recovery cannot authenticate.
  */
-internal class TeachingSession(
-    client: OkHttpClient,
+internal class TeachingSession private constructor(
     private val loginUrl: HttpUrl,
     private val accountUrl: HttpUrl,
 ) : Interceptor {
     class LoginRequiredException : IOException("Interactive login is required")
 
-    private val authenticationClient = client.newBuilder()
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .build()
+    companion object {
+        fun client(baseClient: OkHttpClient, loginUrl: HttpUrl, accountUrl: HttpUrl): OkHttpClient {
+            return baseClient.newBuilder()
+                .followRedirects(false)
+                .apply { interceptors().add(0, TeachingSession(loginUrl, accountUrl)) }
+                .build()
+        }
+    }
+
     private val authenticationLock = Any()
+    @Volatile
     private var generation = 0
+    private var recoveryFailure: IOException? = null
 
     override fun intercept(chain: Interceptor.Chain): Response {
-        val observedGeneration = synchronized(authenticationLock) { generation }
+        val observedGeneration = generation
         val original = chain.proceed(chain.request())
         if (!requiresLogin(original)) return original
         original.close()
 
         synchronized(authenticationLock) {
             if (generation == observedGeneration) {
-                restoreSession()
-                generation++
+                recoveryFailure = null
+                try {
+                    restoreSession(chain)
+                } catch (error: IOException) {
+                    recoveryFailure = error
+                } finally {
+                    generation++
+                }
             }
+            val failure = recoveryFailure
+            if (failure is LoginRequiredException) throw LoginRequiredException()
+            if (failure != null) throw IOException("Unable to restore the teaching session", failure)
         }
 
         val retried = chain.proceed(chain.request())
@@ -46,10 +61,10 @@ internal class TeachingSession(
         return retried
     }
 
-    private fun restoreSession() {
+    private fun restoreSession(chain: Interceptor.Chain) {
         var url = loginUrl
         repeat(10) {
-            authenticationClient.newCall(Request.Builder().url(url).build()).execute().use { response ->
+            chain.proceed(Request.Builder().url(url).build()).use { response ->
                 if (response.isSuccessful && response.request.url.host == loginUrl.host &&
                     response.request.url.encodedPath.endsWith("/index_initMenu.html")) {
                     return
