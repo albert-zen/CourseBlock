@@ -5,9 +5,11 @@ import android.os.Handler
 import android.os.Message
 import android.util.Log
 import com.dujiajun.courseblock.model.Course
+import com.dujiajun.courseblock.session.TeachingSession
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.FormBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
@@ -40,28 +42,38 @@ open class UndergraduateDownloader(context: Context) : CourseDownloader(context)
         )
     }
 
+    private val sessionClient by lazy {
+        client.newBuilder()
+            .followRedirects(false)
+            .addInterceptor(TeachingSession(
+                client,
+                loginUrl.toHttpUrl(),
+                "https://jaccount.sjtu.edu.cn/".toHttpUrl(),
+            ))
+            .build()
+    }
+
     override fun getCourses(year: String, term: String, handler: Handler) {
         download(year, term, object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 val message = Message()
-                message.what = FAILED
+                message.what = if (e is TeachingSession.LoginRequiredException) UNLOGIN else FAILED
                 handler.sendMessage(message)
             }
 
-            @Throws(IOException::class)
             override fun onResponse(call: Call, response: Response) {
-                val code = response.code
-                val body = response.body!!.string()
-                Log.i(TAG, "UndergraduateDownloader code: $code, body: $body")
                 val message = Message()
-                if (body.contains("jAccount")) {
-                    message.what = UNLOGIN
-                } else {
-                    courses = parseFrom(body)
-                    if (courses.isNotEmpty()) {
-                        message.what = DOWNLOADED
-                        message.obj = courses
-                    } else {
+                response.use {
+                    Log.i(TAG, "UndergraduateDownloader code: ${response.code}")
+                    try {
+                        courses = parseFrom(response.body?.string().orEmpty())
+                        if (courses.isNotEmpty()) {
+                            message.what = DOWNLOADED
+                            message.obj = courses
+                        } else {
+                            message.what = FAILED
+                        }
+                    } catch (error: IOException) {
                         message.what = FAILED
                     }
                 }
@@ -108,7 +120,7 @@ open class UndergraduateDownloader(context: Context) : CourseDownloader(context)
             .url(courseUrl)
             .post(body)
             .build()
-        client.newCall(request).enqueue(callback)
+        sessionClient.newCall(request).enqueue(callback)
     }
 
     private fun getWeekCode(week: String): String {
