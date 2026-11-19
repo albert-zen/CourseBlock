@@ -3,14 +3,28 @@ package com.dujiajun.courseblock
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
+import androidx.lifecycle.lifecycleScope
 import androidx.preference.DropDownPreference
+import androidx.preference.ListPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceFragmentCompat
+import com.dujiajun.courseblock.calendar.AndroidCalendar
+import com.dujiajun.courseblock.calendar.CalendarImport
+import com.dujiajun.courseblock.calendar.importRemainingCourses
 import com.dujiajun.courseblock.constant.PreferenceKey
 import com.dujiajun.courseblock.helper.APKVersionInfoUtils.getVersionName
 import com.dujiajun.courseblock.helper.CourseManager
+import com.google.android.material.snackbar.Snackbar
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.OkHttpClient
@@ -36,6 +50,21 @@ class SettingsActivity : AppCompatActivity() {
     class SettingsFragment : PreferenceFragmentCompat(), Preference.OnPreferenceChangeListener {
         private lateinit var termPreference: Preference
         private lateinit var statusPreference: DropDownPreference
+        private lateinit var addCalendarPreference: Preference
+        private lateinit var removeCalendarPreference: Preference
+        private var calendarRemovalDialog: AlertDialog? = null
+
+        private val addCalendarPermissions =
+            registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                if (AndroidCalendar.hasPermission(requireContext())) addCalendarCourses()
+                else showCalendarPermissionDenied(R.string.calendar_permission_denied)
+            }
+
+        private val removeCalendarPermissions =
+            registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                if (AndroidCalendar.hasPermission(requireContext())) confirmCalendarRemoval()
+                else showCalendarPermissionDenied(R.string.calendar_remove_no_permission)
+            }
 
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
             setPreferencesFromResource(R.xml.pref_settings, rootKey)
@@ -50,6 +79,7 @@ class SettingsActivity : AppCompatActivity() {
             statusPreference = findPreference(PreferenceKey.STATUS)!!
             statusPreference.summary = statusPreference.entry
             statusPreference.onPreferenceChangeListener = this
+            setupCalendarPreferences()
             updateTermSummary()
             val homepagePreference = findPreference<Preference>("homepage")!!
             homepagePreference.onPreferenceClickListener =
@@ -64,6 +94,111 @@ class SettingsActivity : AppCompatActivity() {
                     false
                 }
             checkNewVersion()
+        }
+
+        private fun setupCalendarPreferences() {
+            val reminderPreference = findPreference<ListPreference>(PreferenceKey.CALENDAR_REMINDER_MINUTES)!!
+            reminderPreference.entries = AndroidCalendar.reminderTimes
+                .map { getString(R.string.calendar_minutes_before, it) }.toTypedArray()
+            reminderPreference.entryValues = AndroidCalendar.reminderTimes.map(Int::toString).toTypedArray()
+            reminderPreference.summaryProvider = Preference.SummaryProvider<ListPreference> { preference ->
+                preference.entry ?: getString(R.string.calendar_minutes_before, AndroidCalendar.DEFAULT_REMINDER_MINUTES)
+            }
+            reminderPreference.setOnPreferenceChangeListener { preference, value ->
+                if (value != (preference as ListPreference).value) {
+                    showCalendarMessage(getString(R.string.calendar_reminder_next_import))
+                }
+                true
+            }
+
+            addCalendarPreference = findPreference("calendar_add")!!
+            addCalendarPreference.setOnPreferenceClickListener {
+                addCalendarCourses()
+                true
+            }
+
+            removeCalendarPreference = findPreference("calendar_remove_all")!!
+            removeCalendarPreference.setOnPreferenceClickListener {
+                if (AndroidCalendar.hasPermission(requireContext())) confirmCalendarRemoval()
+                else removeCalendarPermissions.launch(AndroidCalendar.permissions)
+                true
+            }
+        }
+
+        private fun addCalendarCourses() {
+            val context = requireContext()
+            val manager = CourseManager.getInstance(context.applicationContext)
+            manager.updateStatus()
+            setCalendarActionsEnabled(false)
+            viewLifecycleOwner.lifecycleScope.launch {
+                try {
+                    when (val result = importRemainingCourses(context, manager)) {
+                        is CalendarImport.Message -> showCalendarMessage(result.text)
+                        CalendarImport.PermissionRequired -> addCalendarPermissions.launch(AndroidCalendar.permissions)
+                    }
+                } finally {
+                    setCalendarActionsEnabled(true)
+                }
+            }
+        }
+
+        private fun confirmCalendarRemoval() {
+            if (calendarRemovalDialog?.isShowing == true) return
+            calendarRemovalDialog = AlertDialog.Builder(requireContext())
+                .setTitle(R.string.calendar_remove_all)
+                .setMessage(R.string.calendar_remove_confirm)
+                .setNegativeButton(R.string.cancel, null)
+                .setPositiveButton(R.string.calendar_remove) { _, _ -> removeCalendarCourses() }
+                .show()
+        }
+
+        override fun onDestroyView() {
+            calendarRemovalDialog?.dismiss()
+            calendarRemovalDialog = null
+            super.onDestroyView()
+        }
+
+        private fun removeCalendarCourses() {
+            val application = requireContext().applicationContext
+            val previousCalendar = preferenceManager.sharedPreferences
+                ?.getLong(PreferenceKey.LEGACY_CALENDAR_ID, -1L)?.takeIf { it >= 0 }
+            setCalendarActionsEnabled(false)
+            viewLifecycleOwner.lifecycleScope.launch {
+                try {
+                    val count = withContext(Dispatchers.IO) {
+                        AndroidCalendar(application.contentResolver, application.packageName)
+                            .removeImportedCourses(previousCalendar)
+                    }
+                    val message = if (count == 0) getString(R.string.calendar_remove_empty)
+                    else resources.getQuantityString(R.plurals.calendar_removed, count, count)
+                    showCalendarMessage(message)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    showCalendarMessage(getString(R.string.calendar_remove_failed))
+                } finally {
+                    setCalendarActionsEnabled(true)
+                }
+            }
+        }
+
+        private fun setCalendarActionsEnabled(enabled: Boolean) {
+            addCalendarPreference.isEnabled = enabled
+            removeCalendarPreference.isEnabled = enabled
+        }
+
+        private fun showCalendarPermissionDenied(message: Int) {
+            val content = view ?: return
+            Snackbar.make(content, message, Snackbar.LENGTH_LONG)
+                .setAction(R.string.calendar_open_settings) {
+                    val uri = Uri.fromParts("package", requireContext().packageName, null)
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, uri))
+                }
+                .show()
+        }
+
+        private fun showCalendarMessage(message: String) {
+            Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
         }
 
         private fun updateTermSummary() {

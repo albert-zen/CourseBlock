@@ -1,23 +1,38 @@
 package com.dujiajun.courseblock.calendar
 
+import android.Manifest
+import android.content.Context
 import android.content.ContentProviderOperation
 import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.ContentValues
+import android.content.pm.PackageManager
 import android.provider.CalendarContract
 import android.provider.CalendarContract.Calendars
 import android.provider.CalendarContract.Events
 import android.provider.CalendarContract.Reminders
 import java.time.Instant
 
-internal class AndroidCalendar(private val resolver: ContentResolver, private val packageName: String) {
-    data class Synced(val count: Int, val calendarName: String)
+internal class AndroidCalendar(
+    private val resolver: ContentResolver,
+    private val packageName: String,
+    familyPackage: String = if (packageName in COURSEBLOCK_PACKAGES) COURSEBLOCK_PACKAGE else packageName,
+) {
+    data class Synced(
+        val scheduled: Int,
+        val added: Int,
+        val changed: Boolean,
+        val calendarName: String,
+    )
 
     class HiddenCalendar(val calendarName: String) : IllegalStateException()
 
     private data class LocalCalendar(val id: Long, val visible: Boolean, val displayName: String)
 
-    private val accountName = "$packageName.courses"
+    private val packageNames = courseBlockPackages(familyPackage)
+    private val accountNames = packageNames.map { "$it.courses" }
+    private val accountName = accountNames.first()
+    private val packagePlaceholders = packageNames.joinToString(", ") { "?" }
 
     fun sync(
         calendarName: String,
@@ -25,10 +40,12 @@ internal class AndroidCalendar(private val resolver: ContentResolver, private va
         upcoming: List<CalendarClass>,
         now: Instant,
         previousCalendarId: Long? = null,
+        reminderMinutes: Int = DEFAULT_REMINDER_MINUTES,
     ): Synced = synchronized(writeLock) {
-        val marker = "courseblock://calendar/$termKey"
+        val marker = termMarker(termKey)
         val desired = upcoming.filter { it.start > now }.associateBy { it.identity() }
-        val target = findCalendar(calendarName) ?: if (desired.isNotEmpty()) createCalendar(calendarName) else null
+        val calendars = findCalendars(calendarName)
+        val target = calendars.firstOrNull() ?: if (desired.isNotEmpty()) createCalendar(calendarName) else null
         if (target?.visible == false && desired.isNotEmpty()) throw HiddenCalendar(target.displayName)
         val calendarId = target?.id
         val existing = calendarId?.let { existing(it, marker, now) }.orEmpty()
@@ -42,15 +59,15 @@ internal class AndroidCalendar(private val resolver: ContentResolver, private va
         if (calendarId != null) {
             staleIds.forEach { operations.add(deleteManagedEvent(calendarId, marker, now, it)) }
         }
-        if (previousCalendarId != null && previousCalendarId != calendarId) {
-            existing(previousCalendarId, marker, now).values.flatten().forEach {
-                operations.add(deleteManagedEvent(previousCalendarId, marker, now, it))
+        calendarIds(calendars, previousCalendarId).filterNot { it == calendarId }.forEach { otherId ->
+            existing(otherId, marker, now).values.flatten().forEach { eventId ->
+                operations.add(deleteManagedEvent(otherId, marker, now, eventId))
             }
         }
         for ((identity, occurrence) in desired) {
             val eventId = existing[identity]?.firstOrNull()
             if (eventId != null) {
-                ensureReminder(operations, eventId, savedReminders[eventId].orEmpty())
+                ensureReminder(operations, eventId, savedReminders[eventId].orEmpty(), reminderMinutes)
                 continue
             }
             val eventIndex = operations.size
@@ -67,21 +84,53 @@ internal class AndroidCalendar(private val resolver: ContentResolver, private va
             }).build())
             operations.add(ContentProviderOperation.newInsert(Reminders.CONTENT_URI)
                 .withValueBackReference(Reminders.EVENT_ID, eventIndex)
-                .withValues(reminderValues())
+                .withValues(reminderValues(reminderMinutes))
                 .build())
         }
-        if (operations.isNotEmpty()) resolver.applyBatch(CalendarContract.AUTHORITY, operations)
-        Synced(desired.size, target?.displayName ?: calendarName)
+        val changed = operations.isNotEmpty() && resolver.applyBatch(CalendarContract.AUTHORITY, operations)
+            .any { it.uri != null || (it.count ?: 0) > 0 }
+        Synced(
+            scheduled = desired.size,
+            added = desired.size - retainedIds.size,
+            changed = changed,
+            calendarName = target?.displayName ?: calendarName,
+        )
     }
 
-    private fun findCalendar(fallbackName: String): LocalCalendar? {
-        val fields = arrayOf(Calendars._ID, Calendars.VISIBLE, Calendars.CALENDAR_DISPLAY_NAME)
-        val filter = "${Calendars.ACCOUNT_TYPE} = ? AND ${Calendars.ACCOUNT_NAME} = ? AND ${Calendars.NAME} = ?"
-        val args = arrayOf(CalendarContract.ACCOUNT_TYPE_LOCAL, accountName, CALENDAR_NAME)
+    fun removeImportedCourses(previousCalendarId: Long? = null): Int = synchronized(writeLock) {
+        val calendarIds = calendarIds(findCalendars(""), previousCalendarId)
+        val operations = calendarIds.map { id ->
+            ContentProviderOperation.newDelete(Events.CONTENT_URI)
+                .withSelection(
+                    "$managedInCalendar AND ${Events.CUSTOM_APP_URI} GLOB ?",
+                    managedEventArgs(id, "$TERM_MARKER_PREFIX*"),
+                )
+                .build()
+        }
+        if (operations.isEmpty()) 0
+        else resolver.applyBatch(CalendarContract.AUTHORITY, ArrayList(operations)).sumOf { it.count ?: 0 }
+    }
+
+    private fun termMarker(termKey: String) = TERM_MARKER_PREFIX + termKey
+
+    private fun calendarIds(calendars: List<LocalCalendar>, previousId: Long?): List<Long> =
+        (calendars.map { it.id } + listOfNotNull(previousId)).distinct()
+
+    private fun findCalendars(fallbackName: String): List<LocalCalendar> {
+        val fields = arrayOf(Calendars._ID, Calendars.VISIBLE, Calendars.CALENDAR_DISPLAY_NAME, Calendars.ACCOUNT_NAME)
+        val filter = "${Calendars.ACCOUNT_TYPE} = ? AND ${Calendars.NAME} = ? AND " +
+            "${Calendars.ACCOUNT_NAME} IN ($packagePlaceholders) AND ${Calendars.OWNER_ACCOUNT} = ${Calendars.ACCOUNT_NAME}"
+        val args = arrayOf(CalendarContract.ACCOUNT_TYPE_LOCAL, CALENDAR_NAME, *accountNames.toTypedArray())
         return requireNotNull(resolver.query(Calendars.CONTENT_URI, fields, filter, args, Calendars._ID)).use { cursor ->
-            if (!cursor.moveToFirst()) return@use null
-            val displayName = cursor.getString(2).orEmpty().ifBlank { fallbackName }
-            LocalCalendar(cursor.getLong(0), cursor.getInt(1) == 1, displayName)
+            val preferred = mutableListOf<LocalCalendar>()
+            val legacy = mutableListOf<LocalCalendar>()
+            while (cursor.moveToNext()) {
+                val name = cursor.getString(2).orEmpty().ifBlank { fallbackName }
+                val calendar = LocalCalendar(cursor.getLong(0), cursor.getInt(1) == 1, name)
+                // Keep using the oldest existing variant calendar when there is no shared one yet.
+                if (cursor.getString(3) == accountName) preferred.add(calendar) else legacy.add(calendar)
+            }
+            preferred + legacy
         }
     }
 
@@ -115,11 +164,16 @@ internal class AndroidCalendar(private val resolver: ContentResolver, private va
                 managedEventArgs(calendarId, marker, now) + eventId.toString())
             .build()
 
-    private val managedFutureEvent = "${Events.CALENDAR_ID} = ? AND ${Events.CUSTOM_APP_PACKAGE} = ? AND " +
-        "${Events.CUSTOM_APP_URI} = ? AND ${Events.DELETED} = 0 AND ${Events.DTSTART} > ?"
+    private val managedInCalendar = "${Events.CALENDAR_ID} = ? AND " +
+        "${Events.CUSTOM_APP_PACKAGE} IN ($packagePlaceholders) AND ${Events.DELETED} = 0"
+    private val managedEvent = "$managedInCalendar AND ${Events.CUSTOM_APP_URI} = ?"
+    private val managedFutureEvent = "$managedEvent AND ${Events.DTSTART} > ?"
+
+    private fun managedEventArgs(calendarId: Long, marker: String) =
+        arrayOf(calendarId.toString(), *packageNames.toTypedArray(), marker)
 
     private fun managedEventArgs(calendarId: Long, marker: String, now: Instant) =
-        arrayOf(calendarId.toString(), packageName, marker, now.toEpochMilli().toString())
+        managedEventArgs(calendarId, marker) + now.toEpochMilli().toString()
 
     private fun existing(calendarId: Long, marker: String, now: Instant): Map<EventIdentity, List<Long>> {
         val fields = arrayOf(Events._ID, Events.TITLE, Events.EVENT_LOCATION, Events.DTSTART, Events.DTEND)
@@ -160,19 +214,20 @@ internal class AndroidCalendar(private val resolver: ContentResolver, private va
         operations: MutableList<ContentProviderOperation>,
         event: Long,
         reminders: List<SavedReminder>,
+        reminderMinutes: Int,
     ) {
-        if (reminders.any { it.minutes == REMINDER_MINUTES && it.method == Reminders.METHOD_ALERT }) return
-        val existing = reminders.firstOrNull()
+        if (reminders.any { it.minutes == reminderMinutes && it.method == Reminders.METHOD_ALERT }) return
+        val existing = reminders.firstOrNull { it.method == Reminders.METHOD_ALERT }
         val operation = if (existing == null) {
             ContentProviderOperation.newInsert(Reminders.CONTENT_URI).withValue(Reminders.EVENT_ID, event)
         } else {
             ContentProviderOperation.newUpdate(ContentUris.withAppendedId(Reminders.CONTENT_URI, existing.id))
         }
-        operations.add(operation.withValues(reminderValues()).build())
+        operations.add(operation.withValues(reminderValues(reminderMinutes)).build())
     }
 
-    private fun reminderValues() = ContentValues().apply {
-        put(Reminders.MINUTES, REMINDER_MINUTES)
+    private fun reminderValues(minutes: Int) = ContentValues().apply {
+        put(Reminders.MINUTES, minutes)
         put(Reminders.METHOD, Reminders.METHOD_ALERT)
     }
 
@@ -183,8 +238,20 @@ internal class AndroidCalendar(private val resolver: ContentResolver, private va
     private data class EventIdentity(val title: String, val location: String, val start: Long, val end: Long)
 
     companion object {
+        private const val COURSEBLOCK_PACKAGE = "com.dujiajun.courseblock"
+        private val COURSEBLOCK_PACKAGES = courseBlockPackages(COURSEBLOCK_PACKAGE)
+
+        private fun courseBlockPackages(base: String) = listOf(base, "$base.preview", "$base.verify")
+
         private const val CALENDAR_NAME = "courseblock-classes"
-        const val REMINDER_MINUTES = 15
+        private const val TERM_MARKER_PREFIX = "courseblock://calendar/"
+        const val DEFAULT_REMINDER_MINUTES = 15
+        val reminderTimes = listOf(5, 10, DEFAULT_REMINDER_MINUTES, 30, 60)
+        val permissions = arrayOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR)
+
+        fun hasPermission(context: Context) = permissions.all {
+            context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }
         private val writeLock = Any()
     }
 }
