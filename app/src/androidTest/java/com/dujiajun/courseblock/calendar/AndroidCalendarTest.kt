@@ -87,8 +87,6 @@ class AndroidCalendarTest {
 
             val id = calendarIds(account).single()
             val saved = events(id).single { it.second == first.title }
-            resolver.delete(Reminders.CONTENT_URI, "${Reminders.EVENT_ID} = ?", arrayOf(saved.first.toString()))
-            calendar.sync(calendarName, "this", listOf(first), now)
             requireNotNull(resolver.query(
                 Reminders.CONTENT_URI, arrayOf(Reminders.MINUTES, Reminders.METHOD),
                 "${Reminders.EVENT_ID} = ?", arrayOf(saved.first.toString()), null,
@@ -104,7 +102,7 @@ class AndroidCalendarTest {
             assertEquals(moved.start.toEpochMilli(), movedEvent.third)
             assertEquals(2, events(id).size)
 
-            val newReminder = calendar.sync(calendarName, "this", listOf(moved), now, reminderMinutes = 30)
+            val newReminder = calendar.sync(calendarName, "this", listOf(moved), now, reminderMinutes = setOf(30))
             assertEquals(1, newReminder.scheduled)
             assertEquals(0, newReminder.added)
             assertTrue(newReminder.changed)
@@ -176,6 +174,98 @@ class AndroidCalendarTest {
                 calendarIds(account).forEach { id ->
                     resolver.delete(ContentUris.withAppendedId(localCalendars(account), id), null, null)
                 }
+            }
+        }
+    }
+
+    @Test
+    fun multipleRemindersUpdateInPlaceAndCanBeTurnedOff() {
+        val namespace = "${context.packageName}.reminders.${UUID.randomUUID()}"
+        val calendar = AndroidCalendar(resolver, namespace)
+        val account = "$namespace.courses"
+        val now = Instant.now()
+        val course = CalendarClass("Class", "", now.plusSeconds(86_400), now.plusSeconds(90_000))
+        try {
+            val times = setOf(0, 5, 12, 30, 60)
+            assertEquals(1, calendar.sync("CourseBlock", "this", listOf(course), now, reminderMinutes = times).added)
+            val id = calendarIds(account).single()
+            val eventId = events(id).single().first
+
+            fun alertTimes(): List<Int> = requireNotNull(resolver.query(
+                Reminders.CONTENT_URI, arrayOf(Reminders.MINUTES), "${Reminders.EVENT_ID} = ? AND ${Reminders.METHOD} = ?",
+                arrayOf(eventId.toString(), Reminders.METHOD_ALERT.toString()), Reminders.MINUTES,
+            )).use { cursor ->
+                buildList { while (cursor.moveToNext()) add(cursor.getInt(0)) }
+            }
+
+            assertEquals(times.sorted(), alertTimes())
+            val same = calendar.sync("CourseBlock", "this", listOf(course), now, reminderMinutes = times)
+            assertEquals(0, same.added)
+            assertFalse(same.changed)
+            assertEquals(times.sorted(), alertTimes())
+
+            val changed = calendar.sync("CourseBlock", "this", listOf(course), now, reminderMinutes = setOf(0, 10))
+            assertEquals(0, changed.added)
+            assertTrue(changed.changed)
+            assertEquals(listOf(0, 10), alertTimes())
+
+            val disabled = calendar.sync("CourseBlock", "this", listOf(course), now, reminderMinutes = emptySet())
+            assertEquals(0, disabled.added)
+            assertTrue(disabled.changed)
+            assertTrue(alertTimes().isEmpty())
+            assertEquals(eventId, events(id).single().first)
+        } finally {
+            calendarIds(account).forEach { id ->
+                resolver.delete(ContentUris.withAppendedId(localCalendars(account), id), null, null)
+            }
+        }
+    }
+
+    @Test
+    fun savingDefaultsUpdatesOnlyUnchangedFutureCourseReminders() {
+        val namespace = "${context.packageName}.autoupdate.${UUID.randomUUID()}"
+        val calendar = AndroidCalendar(resolver, namespace)
+        val account = "$namespace.courses"
+        val now = Instant.now()
+        val course = CalendarClass("Unchanged", "", now.plusSeconds(86_400), now.plusSeconds(90_000))
+        val manual = course.copy(title = "Custom")
+        val past = course.copy(
+            title = "Past", start = now.minusSeconds(86_400), end = now.minusSeconds(82_800),
+        )
+        try {
+            calendar.sync("CourseBlock", "first", listOf(course, manual), now)
+            calendar.sync("CourseBlock", "second", listOf(past), now.minusSeconds(172_800))
+            val id = calendarIds(account).single()
+            val ids = events(id).associate { it.second to it.first }
+            val manualId = ids.getValue(manual.title)
+            resolver.delete(Reminders.CONTENT_URI, "${Reminders.EVENT_ID} = ?", arrayOf(manualId.toString()))
+            resolver.insert(Reminders.CONTENT_URI, ContentValues().apply {
+                put(Reminders.EVENT_ID, manualId)
+                put(Reminders.MINUTES, 25)
+                put(Reminders.METHOD, Reminders.METHOD_ALERT)
+            })
+
+            // Simulate an import created before the application started recording applied defaults.
+            val regularId = ids.getValue(course.title)
+            resolver.update(ContentUris.withAppendedId(Events.CONTENT_URI, regularId),
+                ContentValues().apply { put(Events.CUSTOM_APP_URI, "courseblock://calendar/first") }, null, null)
+
+            fun times(eventId: Long) = requireNotNull(resolver.query(
+                Reminders.CONTENT_URI, arrayOf(Reminders.MINUTES), "${Reminders.EVENT_ID} = ?",
+                arrayOf(eventId.toString()), Reminders.MINUTES,
+            )).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getInt(0)) } }
+
+            assertEquals(1, calendar.updateImportedReminders(now, null, setOf(5), setOf(0, 12)))
+            assertEquals(listOf(0, 12), times(regularId))
+            assertEquals(listOf(25), times(manualId))
+            assertEquals(listOf(15), times(ids.getValue(past.title)))
+            assertEquals(0, calendar.updateImportedReminders(now, null, setOf(5), setOf(0, 12)))
+            calendar.sync("CourseBlock", "first", listOf(course, manual), now, reminderMinutes = setOf(0, 12))
+            assertEquals(listOf(25), times(manualId))
+            assertEquals(ids, events(id).associate { it.second to it.first })
+        } finally {
+            calendarIds(account).forEach { id ->
+                resolver.delete(ContentUris.withAppendedId(localCalendars(account), id), null, null)
             }
         }
     }
